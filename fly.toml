@@ -1,0 +1,14 @@
+app = "tg-claude-bot"
+primary_region = "sin"
+
+[build]
+
+[env]
+  NODE_ENV = "production"
+
+[[services]]
+  internal_port = 3000
+  protocol = "tcp"
+
+[processes]
+  app = "node bot.js"
