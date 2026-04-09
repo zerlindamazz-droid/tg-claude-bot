@@ -52,8 +52,19 @@ class MemPalace {
         created_at INTEGER DEFAULT (strftime('%s','now'))
       );
 
+      CREATE TABLE IF NOT EXISTS reminders (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        chat_id TEXT NOT NULL,
+        message TEXT NOT NULL,
+        due_at INTEGER NOT NULL,        -- unix timestamp
+        repeat TEXT DEFAULT NULL,       -- null | daily | weekly
+        sent INTEGER DEFAULT 0,
+        created_at INTEGER DEFAULT (strftime('%s','now'))
+      );
+
       CREATE INDEX IF NOT EXISTS idx_chat_hall ON memories(chat_id, hall);
       CREATE INDEX IF NOT EXISTS idx_keywords ON memories(keywords);
+      CREATE INDEX IF NOT EXISTS idx_reminders_due ON reminders(due_at, sent);
     `);
   }
 
@@ -142,6 +153,40 @@ class MemPalace {
       INSERT INTO bot_evolution (system_additions, reason) VALUES (?, ?)
     `).run(systemAddition, reason);
     console.log(`[Evolution] ${reason}`);
+  }
+
+  // ── Reminders ───────────────────────────────────────────────────────────────
+  addReminder(chatId, message, dueAt, repeat = null) {
+    this.db.prepare(`
+      INSERT INTO reminders (chat_id, message, due_at, repeat) VALUES (?, ?, ?, ?)
+    `).run(String(chatId), message, Math.floor(dueAt / 1000), repeat);
+  }
+
+  getDueReminders() {
+    const now = Math.floor(Date.now() / 1000);
+    return this.db.prepare(`
+      SELECT * FROM reminders WHERE due_at <= ? AND sent = 0
+    `).all(now);
+  }
+
+  markReminderSent(id, repeat) {
+    if (repeat === 'daily') {
+      this.db.prepare(`UPDATE reminders SET due_at = due_at + 86400 WHERE id = ?`).run(id);
+    } else if (repeat === 'weekly') {
+      this.db.prepare(`UPDATE reminders SET due_at = due_at + 604800 WHERE id = ?`).run(id);
+    } else {
+      this.db.prepare(`UPDATE reminders SET sent = 1 WHERE id = ?`).run(id);
+    }
+  }
+
+  listReminders(chatId) {
+    return this.db.prepare(`
+      SELECT * FROM reminders WHERE chat_id = ? AND sent = 0 ORDER BY due_at ASC
+    `).all(String(chatId));
+  }
+
+  deleteReminder(id) {
+    this.db.prepare(`UPDATE reminders SET sent = 1 WHERE id = ?`).run(id);
   }
 
   // ── Stats ───────────────────────────────────────────────────────────────────

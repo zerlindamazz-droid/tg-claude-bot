@@ -1,6 +1,7 @@
 require('dotenv').config();
 const http = require('http');
 const https = require('https');
+const cron = require('node-cron');
 const { Telegraf } = require('telegraf');
 const Anthropic = require('@anthropic-ai/sdk');
 const { google } = require('googleapis');
@@ -8,21 +9,35 @@ const palace = require('./memory');
 
 const bot = new Telegraf(process.env.TELEGRAM_TOKEN);
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-const conversations = new Map(); // in-session history
+const conversations = new Map();
 
-// ── Health check + Heartbeat (keeps Render from sleeping) ────────────────────
+// ── Health check server (Render requires a listening port) ───────────────────
 const PORT = process.env.PORT || 3000;
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
-
 http.createServer((req, res) => res.end('OK')).listen(PORT, () => {
   console.log(`Health check on :${PORT}`);
-  // Ping self every 10 min so Render doesn't spin down
+  // Keep Render alive by pinging self
   setInterval(() => {
-    const url = new URL(SELF_URL);
-    const mod = url.protocol === 'https:' ? https : http;
-    mod.get(SELF_URL, r => console.log(`[Heartbeat] ${r.statusCode}`))
-       .on('error', e => console.log(`[Heartbeat error] ${e.message}`));
+    const mod = SELF_URL.startsWith('https') ? https : http;
+    mod.get(SELF_URL, () => {}).on('error', () => {});
   }, 10 * 60 * 1000);
+});
+
+// ── Reminder heartbeat: check every minute ───────────────────────────────────
+cron.schedule('* * * * *', async () => {
+  const due = palace.getDueReminders();
+  for (const r of due) {
+    try {
+      await bot.telegram.sendMessage(r.chat_id,
+        `⏰ *提醒*\n\n${r.message}`,
+        { parse_mode: 'Markdown' }
+      );
+      palace.markReminderSent(r.id, r.repeat);
+      console.log(`[Reminder sent] ${r.chat_id}: ${r.message}`);
+    } catch (e) {
+      console.error(`[Reminder error] ${e.message}`);
+    }
+  }
 });
 
 // ── Gmail OAuth2 ─────────────────────────────────────────────────────────────
@@ -84,6 +99,33 @@ const TOOLS = [
     }
   },
   {
+    name: 'set_reminder',
+    description: 'Set a reminder that will be pushed to the user via Telegram at the specified time.',
+    input_schema: {
+      type: 'object',
+      properties: {
+        message: { type: 'string', description: 'What to remind the user about' },
+        due_at: { type: 'string', description: 'ISO 8601 datetime string, e.g. "2026-04-10T09:00:00+08:00". Use the user\'s timezone (Asia/Shanghai by default).' },
+        repeat: { type: 'string', enum: ['once', 'daily', 'weekly'], description: 'How often to repeat (default: once)' }
+      },
+      required: ['message', 'due_at']
+    }
+  },
+  {
+    name: 'list_reminders',
+    description: 'List all active reminders for the user.',
+    input_schema: { type: 'object', properties: {}, required: [] }
+  },
+  {
+    name: 'delete_reminder',
+    description: 'Cancel/delete a reminder by its ID.',
+    input_schema: {
+      type: 'object',
+      properties: { reminder_id: { type: 'number' } },
+      required: ['reminder_id']
+    }
+  },
+  {
     name: 'remember',
     description: 'Save an important fact about the user to long-term memory.',
     input_schema: {
@@ -112,6 +154,30 @@ const TOOLS = [
 // ── Tool executor ─────────────────────────────────────────────────────────────
 async function executeTool(name, input, chatId) {
   console.log(`  🔧 ${name}:`, JSON.stringify(input).slice(0, 120));
+
+  if (name === 'set_reminder') {
+    const due = new Date(input.due_at);
+    if (isNaN(due)) return `Error: invalid date "${input.due_at}"`;
+    const repeat = input.repeat === 'once' ? null : (input.repeat || null);
+    palace.addReminder(chatId, input.message, due.getTime(), repeat);
+    const label = repeat ? `（每${repeat === 'daily' ? '天' : '周'}重复）` : '';
+    return `✓ 提醒已设置：${input.message}\n时间：${due.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}${label}`;
+  }
+
+  if (name === 'list_reminders') {
+    const reminders = palace.listReminders(chatId);
+    if (!reminders.length) return '没有待提醒的事项。';
+    return reminders.map(r => {
+      const t = new Date(r.due_at * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+      const rep = r.repeat ? ` [${r.repeat}]` : '';
+      return `ID ${r.id}: ${r.message}\n⏰ ${t}${rep}`;
+    }).join('\n\n');
+  }
+
+  if (name === 'delete_reminder') {
+    palace.deleteReminder(input.reminder_id);
+    return `✓ 提醒 ID ${input.reminder_id} 已取消`;
+  }
 
   if (name === 'remember') {
     palace.store(chatId, 'semantic', input.fact, { room: input.category || 'general', importance: 3 });
@@ -280,7 +346,7 @@ async function processWithClaude(chatId, userMessage) {
 
 // ── Bot commands ──────────────────────────────────────────────────────────────
 bot.start(ctx => ctx.reply(
-  '🤖 *Claude AI — Memory Edition*\n\n我有长期记忆，每次对话都会记住重要信息。\n\n功能：\n• 📧 查看/发送 Gmail\n• 🧠 长期记忆\n• 🧬 自我进化\n\n命令：\n`/memory` — 查看记忆统计\n`/profile` — 查看用户画像\n`/clear` — 重置本次对话\n`/help` — 帮助',
+  '🤖 *Claude AI — Memory Edition*\n\n功能：\n• 📧 查看/发送 Gmail\n• 🧠 长期记忆\n• ⏰ 定时提醒（心跳）\n• 🧬 自我进化\n\n命令：\n`/reminders` — 查看所有提醒\n`/memory` — 记忆统计\n`/profile` — 用户画像\n`/clear` — 重置对话',
   { parse_mode: 'Markdown' }
 ));
 
@@ -299,6 +365,17 @@ bot.command('memory', ctx => {
   if (!stats.length) return ctx.reply('暂无记忆数据。');
   const lines = stats.map(s => `• ${s.hall}: ${s.count} 条`).join('\n');
   ctx.reply(`🧠 *记忆统计*\n\n${lines}`, { parse_mode: 'Markdown' });
+});
+
+bot.command('reminders', ctx => {
+  const reminders = palace.listReminders(ctx.chat.id);
+  if (!reminders.length) return ctx.reply('没有待提醒的事项。\n\n说「提醒我明天9点开会」来设置一个！');
+  const lines = reminders.map(r => {
+    const t = new Date(r.due_at * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+    const rep = r.repeat ? ` 🔁${r.repeat}` : '';
+    return `*ID ${r.id}* ${rep}\n${r.message}\n⏰ ${t}`;
+  }).join('\n\n');
+  ctx.reply(`⏰ *待提醒事项*\n\n${lines}\n\n说「取消提醒 ID X」可以删除`, { parse_mode: 'Markdown' });
 });
 
 bot.command('profile', ctx => {
