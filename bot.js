@@ -1,7 +1,12 @@
 require('dotenv').config();
+const http = require('http');
 const { Telegraf } = require('telegraf');
 const Anthropic = require('@anthropic-ai/sdk');
 const { google } = require('googleapis');
+
+// Health check server for Render free tier
+const PORT = process.env.PORT || 3000;
+http.createServer((req, res) => res.end('OK')).listen(PORT, () => console.log(`Health check on :${PORT}`));
 
 const bot = new Telegraf(process.env.TELEGRAM_TOKEN);
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
