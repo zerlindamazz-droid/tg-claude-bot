@@ -1,0 +1,22 @@
+{
+  "memories": [
+    {
+      "id": 1,
+      "chatId": "test",
+      "hall": "semantic",
+      "room": null,
+      "content": "test fact",
+      "keywords": [
+        "test",
+        "fact"
+      ],
+      "importance": 1,
+      "createdAt": 1775874712236,
+      "accessCount": 0
+    }
+  ],
+  "profiles": {},
+  "evolutions": [],
+  "reminders": [],
+  "_nextId": 2
+}
