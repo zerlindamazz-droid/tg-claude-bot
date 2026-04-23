@@ -113,6 +113,12 @@ const palace = {
     db.get('reminders').find({ id }).assign({ sent: true }).write();
   },
 
+  // ── Get all registered chat IDs (for proactive messages) ────────────────────
+  getAllChatIds() {
+    const profiles = db.get('profiles').value();
+    return Object.keys(profiles).filter(id => profiles[id].chatId);
+  },
+
   // ── Stats ───────────────────────────────────────────────────────────────────
   stats(chatId) {
     const all = db.get('memories').filter({ chatId: String(chatId) }).value();

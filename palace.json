@@ -15,7 +15,12 @@
       "accessCount": 0
     }
   ],
-  "profiles": {},
+  "profiles": {
+    "test123": {
+      "chatId": "test123",
+      "name": "Test"
+    }
+  },
   "evolutions": [],
   "reminders": [],
   "_nextId": 2

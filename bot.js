@@ -11,36 +11,37 @@ const bot = new Telegraf(process.env.TELEGRAM_TOKEN);
 const anthropic = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 const conversations = new Map();
 
-// ── Health check server (Render requires a listening port) ───────────────────
+// ── Health check server ──────────────────────────────────────────────────────
 const PORT = process.env.PORT || 3000;
 const SELF_URL = process.env.RENDER_EXTERNAL_URL || `http://localhost:${PORT}`;
 http.createServer((req, res) => res.end('OK')).listen(PORT, () => {
   console.log(`Health check on :${PORT}`);
-  // Keep Render alive by pinging self
   setInterval(() => {
     const mod = SELF_URL.startsWith('https') ? https : http;
     mod.get(SELF_URL, () => {}).on('error', () => {});
   }, 10 * 60 * 1000);
 });
 
-// ── Reminder heartbeat: check every minute ───────────────────────────────────
-cron.schedule('* * * * *', async () => {
-  const due = palace.getDueReminders();
-  for (const r of due) {
-    try {
-      await bot.telegram.sendMessage(r.chat_id,
-        `⏰ *提醒*\n\n${r.message}`,
-        { parse_mode: 'Markdown' }
-      );
-      palace.markReminderSent(r.id, r.repeat);
-      console.log(`[Reminder sent] ${r.chat_id}: ${r.message}`);
-    } catch (e) {
-      console.error(`[Reminder error] ${e.message}`);
-    }
-  }
-});
+// ── Language detection ────────────────────────────────────────────────────────
+function detectLang(text) {
+  if (/[\u4e00-\u9fff]/.test(text)) return 'zh';
+  if (/[\u3040-\u30ff]/.test(text)) return 'ja';
+  if (/[\uac00-\ud7af]/.test(text)) return 'ko';
+  if (/[\u0400-\u04ff]/.test(text)) return 'ru';
+  if (/[àáâãäåæçèéêëìíîïðñòóôõöùúûüý]/i.test(text)) return 'fr_es';
+  return 'en';
+}
 
-// ── Gmail OAuth2 ─────────────────────────────────────────────────────────────
+const LANG_INSTRUCTION = {
+  zh: '用中文回复，保持简洁。',
+  en: 'Reply in English, be concise.',
+  ja: '日本語で返答してください。',
+  ko: '한국어로 답변해 주세요.',
+  ru: 'Отвечайте на русском языке.',
+  fr_es: 'Reply in the same language as the user (French or Spanish).',
+};
+
+// ── Gmail OAuth2 ──────────────────────────────────────────────────────────────
 function getGmailClient() {
   const auth = new google.auth.OAuth2(
     process.env.GMAIL_CLIENT_ID,
@@ -50,7 +51,15 @@ function getGmailClient() {
   return google.gmail({ version: 'v1', auth });
 }
 
-// ── Tools ────────────────────────────────────────────────────────────────────
+async function getUnreadCount() {
+  try {
+    const gmail = getGmailClient();
+    const res = await gmail.users.messages.list({ userId: 'me', q: 'is:unread', maxResults: 1 });
+    return res.data.resultSizeEstimate || 0;
+  } catch { return null; }
+}
+
+// ── Tools ─────────────────────────────────────────────────────────────────────
 const TOOLS = [
   {
     name: 'search_emails',
@@ -58,8 +67,8 @@ const TOOLS = [
     input_schema: {
       type: 'object',
       properties: {
-        query: { type: 'string', description: 'Gmail search query e.g. "from:boss@co.com", "is:unread", "newer_than:3d"' },
-        max_results: { type: 'number', description: 'Max results (default 10)' }
+        query: { type: 'string', description: 'Gmail search query, e.g. "from:boss@co.com is:unread newer_than:3d"' },
+        max_results: { type: 'number' }
       },
       required: ['query']
     }
@@ -78,47 +87,43 @@ const TOOLS = [
     description: 'Send an email via Gmail.',
     input_schema: {
       type: 'object',
-      properties: {
-        to: { type: 'string' },
-        subject: { type: 'string' },
-        body: { type: 'string' }
-      },
+      properties: { to: { type: 'string' }, subject: { type: 'string' }, body: { type: 'string' } },
       required: ['to', 'subject', 'body']
     }
   },
   {
     name: 'list_emails',
-    description: 'List recent emails from a label.',
+    description: 'List recent emails.',
     input_schema: {
       type: 'object',
       properties: {
         max_results: { type: 'number' },
-        label: { type: 'string', description: 'INBOX, UNREAD, SENT (default INBOX)' }
+        label: { type: 'string', description: 'INBOX | UNREAD | SENT (default: INBOX)' }
       },
       required: []
     }
   },
   {
     name: 'set_reminder',
-    description: 'Set a reminder that will be pushed to the user via Telegram at the specified time.',
+    description: 'Set a reminder pushed to user via Telegram at a specific time.',
     input_schema: {
       type: 'object',
       properties: {
-        message: { type: 'string', description: 'What to remind the user about' },
-        due_at: { type: 'string', description: 'ISO 8601 datetime string, e.g. "2026-04-10T09:00:00+08:00". Use the user\'s timezone (Asia/Shanghai by default).' },
-        repeat: { type: 'string', enum: ['once', 'daily', 'weekly'], description: 'How often to repeat (default: once)' }
+        message: { type: 'string' },
+        due_at: { type: 'string', description: 'ISO 8601 datetime, e.g. "2026-04-10T09:00:00+08:00"' },
+        repeat: { type: 'string', enum: ['once', 'daily', 'weekly'] }
       },
       required: ['message', 'due_at']
     }
   },
   {
     name: 'list_reminders',
-    description: 'List all active reminders for the user.',
+    description: 'List all active reminders.',
     input_schema: { type: 'object', properties: {}, required: [] }
   },
   {
     name: 'delete_reminder',
-    description: 'Cancel/delete a reminder by its ID.',
+    description: 'Cancel a reminder by ID.',
     input_schema: {
       type: 'object',
       properties: { reminder_id: { type: 'number' } },
@@ -131,20 +136,20 @@ const TOOLS = [
     input_schema: {
       type: 'object',
       properties: {
-        fact: { type: 'string', description: 'The fact to remember, e.g. "User prefers concise replies"' },
-        category: { type: 'string', enum: ['preference', 'personal', 'work', 'task', 'other'], description: 'Category of fact' }
+        fact: { type: 'string' },
+        category: { type: 'string', enum: ['preference', 'personal', 'work', 'task', 'language', 'other'] }
       },
       required: ['fact']
     }
   },
   {
     name: 'evolve',
-    description: 'Add a new rule or behavior to your own system prompt when you notice a pattern in how this user wants things done.',
+    description: 'Add a new behavior rule to yourself when you notice a consistent pattern. Rules persist forever and shape all future responses.',
     input_schema: {
       type: 'object',
       properties: {
-        new_rule: { type: 'string', description: 'A new behavior rule to add to yourself, e.g. "Always end task summaries with a bullet list"' },
-        reason: { type: 'string', description: 'Why you are adding this rule' }
+        new_rule: { type: 'string', description: 'The new behavior, e.g. "Always greet user by name", "End code replies with test suggestions"' },
+        reason: { type: 'string', description: 'Why this pattern was noticed' }
       },
       required: ['new_rule', 'reason']
     }
@@ -158,37 +163,36 @@ async function executeTool(name, input, chatId) {
   if (name === 'set_reminder') {
     const due = new Date(input.due_at);
     if (isNaN(due)) return `Error: invalid date "${input.due_at}"`;
-    const repeat = input.repeat === 'once' ? null : (input.repeat || null);
+    const repeat = (!input.repeat || input.repeat === 'once') ? null : input.repeat;
     palace.addReminder(chatId, input.message, due.getTime(), repeat);
-    const label = repeat ? `（每${repeat === 'daily' ? '天' : '周'}重复）` : '';
-    return `✓ 提醒已设置：${input.message}\n时间：${due.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })}${label}`;
+    const t = due.toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+    const rep = repeat ? `（每${repeat === 'daily' ? '天' : '周'}重复）` : '';
+    return `✓ Reminder set: "${input.message}" at ${t}${rep}`;
   }
 
   if (name === 'list_reminders') {
-    const reminders = palace.listReminders(chatId);
-    if (!reminders.length) return '没有待提醒的事项。';
-    return reminders.map(r => {
-      const t = new Date(r.due_at * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-      const rep = r.repeat ? ` [${r.repeat}]` : '';
-      return `ID ${r.id}: ${r.message}\n⏰ ${t}${rep}`;
-    }).join('\n\n');
+    const list = palace.listReminders(chatId);
+    if (!list.length) return 'No active reminders.';
+    return list.map(r => {
+      const t = new Date(r.dueAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+      return `ID ${r.id}: ${r.message} @ ${t}${r.repeat ? ` [${r.repeat}]` : ''}`;
+    }).join('\n');
   }
 
   if (name === 'delete_reminder') {
     palace.deleteReminder(input.reminder_id);
-    return `✓ 提醒 ID ${input.reminder_id} 已取消`;
+    return `✓ Reminder ${input.reminder_id} cancelled`;
   }
 
   if (name === 'remember') {
     palace.store(chatId, 'semantic', input.fact, { room: input.category || 'general', importance: 3 });
-    palace.updateProfile(chatId, { [`last_fact_${Date.now()}`]: input.fact });
     return `✓ Remembered: "${input.fact}"`;
   }
 
   if (name === 'evolve') {
     palace.addEvolution(input.new_rule, input.reason);
-    palace.store(chatId, 'evolution', `New rule: ${input.new_rule} (Reason: ${input.reason})`, { importance: 5 });
-    return `✓ Evolved: added new rule — ${input.new_rule}`;
+    palace.store(chatId, 'evolution', `Rule: ${input.new_rule}`, { importance: 5 });
+    return `✓ Evolved! New rule added: ${input.new_rule}`;
   }
 
   const gmail = getGmailClient();
@@ -196,13 +200,13 @@ async function executeTool(name, input, chatId) {
   if (name === 'search_emails') {
     try {
       const res = await gmail.users.messages.list({ userId: 'me', q: input.query, maxResults: input.max_results || 10 });
-      const messages = res.data.messages || [];
-      if (!messages.length) return 'No emails found.';
-      const details = await Promise.all(messages.map(async m => {
+      const msgs = res.data.messages || [];
+      if (!msgs.length) return 'No emails found.';
+      const details = await Promise.all(msgs.map(async m => {
         const msg = await gmail.users.messages.get({ userId: 'me', id: m.id, format: 'metadata', metadataHeaders: ['Subject','From','Date'] });
         const h = msg.data.payload.headers;
         const g = n => h.find(x => x.name === n)?.value || '';
-        return `ID: ${m.id}\nFrom: ${g('From')}\nDate: ${g('Date')}\nSubject: ${g('Subject')}\nSnippet: ${msg.data.snippet}`;
+        return `ID: ${m.id}\nFrom: ${g('From')}\nDate: ${g('Date')}\nSubject: ${g('Subject')}\n${msg.data.snippet}`;
       }));
       return details.join('\n\n---\n\n');
     } catch (e) { return `Error: ${e.message}`; }
@@ -214,12 +218,12 @@ async function executeTool(name, input, chatId) {
       const h = msg.data.payload.headers;
       const g = n => h.find(x => x.name === n)?.value || '';
       let body = '';
-      const extractBody = p => {
+      const extract = p => {
         if (p.mimeType === 'text/plain' && p.body?.data) body += Buffer.from(p.body.data, 'base64').toString('utf8');
-        if (p.parts) p.parts.forEach(extractBody);
+        if (p.parts) p.parts.forEach(extract);
       };
-      extractBody(msg.data.payload);
-      return `From: ${g('From')}\nTo: ${g('To')}\nDate: ${g('Date')}\nSubject: ${g('Subject')}\n\n${body || msg.data.snippet}`;
+      extract(msg.data.payload);
+      return `From: ${g('From')}\nDate: ${g('Date')}\nSubject: ${g('Subject')}\n\n${body || msg.data.snippet}`;
     } catch (e) { return `Error: ${e.message}`; }
   }
 
@@ -236,9 +240,9 @@ async function executeTool(name, input, chatId) {
   if (name === 'list_emails') {
     try {
       const res = await gmail.users.messages.list({ userId: 'me', labelIds: [input.label || 'INBOX'], maxResults: input.max_results || 10 });
-      const messages = res.data.messages || [];
-      if (!messages.length) return 'No emails found.';
-      const details = await Promise.all(messages.map(async m => {
+      const msgs = res.data.messages || [];
+      if (!msgs.length) return 'No emails.';
+      const details = await Promise.all(msgs.map(async m => {
         const msg = await gmail.users.messages.get({ userId: 'me', id: m.id, format: 'metadata', metadataHeaders: ['Subject','From','Date'] });
         const h = msg.data.payload.headers;
         const g = n => h.find(x => x.name === n)?.value || '';
@@ -251,68 +255,86 @@ async function executeTool(name, input, chatId) {
   return `Unknown tool: ${name}`;
 }
 
-// ── Build system prompt with memory + evolution ───────────────────────────────
-function buildSystemPrompt(chatId) {
-  // Base
-  let system = `You are a personal AI assistant on Telegram for Zerlinda (zerlindamazz@gmail.com).
-You have access to her Gmail — you can search, read, and send emails.
-You have long-term memory — use the \`remember\` tool to save important facts about the user.
-You can evolve yourself — use the \`evolve\` tool when you notice a pattern in how the user wants things done.
-Always reply in the same language as the user (Chinese or English). Keep replies concise for mobile.`;
+// ── System prompt builder ────────────────────────────────────────────────────
+function buildSystemPrompt(chatId, lang = 'zh') {
+  const langInstr = LANG_INSTRUCTION[lang] || LANG_INSTRUCTION.en;
 
-  // Inject learned evolutions
+  let system = `You are Zerlinda's personal AI assistant on Telegram. Her email: zerlindamazz@gmail.com.
+
+## Core capabilities
+- Access Gmail: search, read, send emails
+- Long-term memory: use \`remember\` to save facts about her
+- Reminders: use \`set_reminder\` to schedule push notifications
+- Self-evolution: use \`evolve\` when you notice a recurring pattern
+
+## Language
+${langInstr}
+You can understand and respond in: Chinese, English, Japanese, Korean, Russian, French, Spanish, and more.
+Always match the language the user writes in.
+
+## Behavior
+- Be proactive: if you notice something important from memory, mention it
+- Be warm but concise — this is a mobile chat
+- When user mentions deadlines, tasks, or important things → save them with \`remember\`
+- When user shows a consistent preference → save it with \`evolve\``;
+
+  // Self-evolution rules
   const evolutions = palace.getEvolutions();
   if (evolutions.length) {
-    system += '\n\n## Your learned behaviors (self-evolution):\n';
-    system += evolutions.map(e => `- ${e.system_additions}`).join('\n');
+    system += '\n\n## Your evolved behaviors (learned from this user):\n';
+    system += evolutions.map(e => `- ${e.rule}`).join('\n');
   }
 
-  // Inject user profile
+  // User profile facts
   const profile = palace.getProfile(chatId);
-  const profileKeys = Object.keys(profile).filter(k => !k.startsWith('last_fact_') && k !== 'updated_at');
-  if (profileKeys.length) {
-    system += '\n\n## Known facts about this user:\n';
-    system += profileKeys.map(k => `- ${k}: ${profile[k]}`).join('\n');
+  const facts = Object.entries(profile)
+    .filter(([k]) => !k.startsWith('last_fact_') && k !== 'updated_at' && k !== 'chatId' && k !== 'lang');
+  if (facts.length) {
+    system += '\n\n## What you know about Zerlinda:\n';
+    system += facts.map(([k, v]) => `- ${k}: ${v}`).join('\n');
   }
 
   return system;
 }
 
 // ── Claude agentic loop ───────────────────────────────────────────────────────
-async function processWithClaude(chatId, userMessage) {
-  // Session history
+async function processWithClaude(chatId, userMessage, forceLang = null) {
   if (!conversations.has(chatId)) conversations.set(chatId, []);
-  const sessionHistory = conversations.get(chatId);
+  const history = conversations.get(chatId);
 
-  // Retrieve relevant long-term memories
-  const memories = palace.recall(chatId, userMessage, { limit: 5 });
+  const lang = forceLang || detectLang(userMessage);
 
-  // Build context injection
-  let contextBlock = '';
-  if (memories.length) {
-    contextBlock = `\n\n[Relevant memories from past conversations:\n${memories.join('\n')}\n]`;
+  // Update stored language preference
+  const profile = palace.getProfile(chatId);
+  if (!profile.lang || profile.lang !== lang) {
+    palace.updateProfile(chatId, { lang });
   }
 
-  const userContent = userMessage + contextBlock;
-  sessionHistory.push({ role: 'user', content: userContent });
-  while (sessionHistory.length > 30) sessionHistory.splice(0, 2);
+  // Recall relevant memories
+  const memories = palace.recall(chatId, userMessage, { limit: 5 });
+  const memBlock = memories.length
+    ? `\n\n[Memory context:\n${memories.join('\n')}\n]`
+    : '';
 
-  const systemPrompt = buildSystemPrompt(chatId);
-  let messages = [...sessionHistory];
+  const userContent = userMessage + memBlock;
+  history.push({ role: 'user', content: userContent });
+  while (history.length > 30) history.splice(0, 2);
+
+  let messages = [...history];
   let finalReply = '';
 
   for (let turn = 0; turn < 15; turn++) {
     const response = await anthropic.messages.create({
       model: 'claude-opus-4-6',
       max_tokens: 4096,
-      system: systemPrompt,
+      system: buildSystemPrompt(chatId, lang),
       tools: TOOLS,
       messages
     });
 
     if (response.stop_reason === 'end_turn') {
       finalReply = response.content.find(b => b.type === 'text')?.text?.trim() || '✓';
-      sessionHistory.push({ role: 'assistant', content: finalReply });
+      history.push({ role: 'assistant', content: finalReply });
       break;
     }
 
@@ -329,66 +351,176 @@ async function processWithClaude(chatId, userMessage) {
         }
       }
       messages.push({ role: 'user', content: results });
-
-      // Capture text blocks as partial reply
-      const textBlock = response.content.find(b => b.type === 'text')?.text;
-      if (textBlock) finalReply = textBlock;
+      const t = response.content.find(b => b.type === 'text')?.text;
+      if (t) finalReply = t;
       continue;
     }
     break;
   }
 
-  // Store episode in long-term memory
   if (finalReply) palace.storeEpisode(chatId, userMessage, finalReply);
-
   return finalReply || '⚠️ No response.';
 }
 
-// ── Bot commands ──────────────────────────────────────────────────────────────
-bot.start(ctx => ctx.reply(
-  '🤖 *Claude AI — Memory Edition*\n\n功能：\n• 📧 查看/发送 Gmail\n• 🧠 长期记忆\n• ⏰ 定时提醒（心跳）\n• 🧬 自我进化\n\n命令：\n`/reminders` — 查看所有提醒\n`/memory` — 记忆统计\n`/profile` — 用户画像\n`/clear` — 重置对话',
-  { parse_mode: 'Markdown' }
-));
+// ── Proactive morning greeting (9am Shanghai) ─────────────────────────────────
+async function sendMorningGreeting(chatId) {
+  console.log(`[Morning greeting] → ${chatId}`);
+  try {
+    // Gather context
+    const reminders = palace.listReminders(String(chatId));
+    const todayReminders = reminders.filter(r => {
+      const due = new Date(r.dueAt);
+      const now = new Date();
+      return due.toDateString() === now.toDateString();
+    });
+    const unread = await getUnreadCount();
+    const memories = palace.recall(String(chatId), 'task deadline important work', { limit: 4 });
+    const profile = palace.getProfile(String(chatId));
+    const lang = profile.lang || 'zh';
 
-bot.help(ctx => ctx.reply(
-  '🤖 *Claude AI Assistant*\n\n示例任务：\n• `帮我查最新邮件`\n• `记住我喜欢简短回复`\n• `给 xxx@gmail.com 发邮件`\n\n`/memory` — 记忆统计\n`/profile` — 用户画像\n`/clear` — 重置对话',
-  { parse_mode: 'Markdown' }
-));
+    const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', weekday: 'long', month: 'long', day: 'numeric' });
+
+    const context = [
+      `Today: ${now}`,
+      todayReminders.length ? `Today's reminders: ${todayReminders.map(r => r.message).join('; ')}` : 'No reminders today.',
+      unread !== null ? `Unread emails: ${unread}` : '',
+      memories.length ? `Recent important memories:\n${memories.join('\n')}` : ''
+    ].filter(Boolean).join('\n');
+
+    const prompt = `Generate a warm, personalized morning greeting for Zerlinda based on:
+${context}
+
+Keep it SHORT (3-5 lines). ${LANG_INSTRUCTION[lang] || LANG_INSTRUCTION.en}
+Mention today's tasks/reminders if any. If unread emails > 0, briefly mention it.
+Be encouraging and natural — like a smart assistant who cares.`;
+
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-6',
+      max_tokens: 300,
+      messages: [{ role: 'user', content: prompt }]
+    });
+
+    const greeting = response.content[0]?.text || '早安！今天也加油 ☀️';
+    await bot.telegram.sendMessage(chatId, `☀️ ${greeting}`, { parse_mode: 'Markdown' });
+  } catch (e) {
+    console.error(`[Morning greeting error] ${e.message}`);
+  }
+}
+
+// ── Proactive weekly check-in (Monday 9am) ───────────────────────────────────
+async function sendWeeklyCheckIn(chatId) {
+  try {
+    const memories = palace.recall(String(chatId), 'task work deadline project', { limit: 6 });
+    const profile = palace.getProfile(String(chatId));
+    const lang = profile.lang || 'zh';
+
+    const prompt = `Generate a brief Monday morning weekly check-in message for Zerlinda.
+Known context:\n${memories.join('\n') || 'No recent context.'}
+Keep it to 3-4 lines. ${LANG_INSTRUCTION[lang] || LANG_INSTRUCTION.en}
+Ask what her main focus is for this week. Be warm and motivating.`;
+
+    const response = await anthropic.messages.create({
+      model: 'claude-opus-4-6',
+      max_tokens: 200,
+      messages: [{ role: 'user', content: prompt }]
+    });
+
+    const msg = response.content[0]?.text || '新的一周开始了！本周有什么重点任务吗？';
+    await bot.telegram.sendMessage(chatId, `📅 ${msg}`, { parse_mode: 'Markdown' });
+  } catch (e) {
+    console.error(`[Weekly check-in error] ${e.message}`);
+  }
+}
+
+// ── Cron jobs ─────────────────────────────────────────────────────────────────
+// Check reminders every minute
+cron.schedule('* * * * *', async () => {
+  const due = palace.getDueReminders();
+  for (const r of due) {
+    try {
+      await bot.telegram.sendMessage(r.chatId, `⏰ *提醒*\n\n${r.message}`, { parse_mode: 'Markdown' });
+      palace.markReminderSent(r.id, r.repeat);
+      console.log(`[Reminder] → ${r.chatId}: ${r.message}`);
+    } catch (e) { console.error(`[Reminder error] ${e.message}`); }
+  }
+});
+
+// Morning greeting: 9:00am Shanghai (01:00 UTC)
+cron.schedule('0 1 * * *', async () => {
+  const chatIds = palace.getAllChatIds();
+  for (const id of chatIds) await sendMorningGreeting(id);
+}, { timezone: 'UTC' });
+
+// Weekly check-in: Monday 9:00am Shanghai
+cron.schedule('0 1 * * 1', async () => {
+  const chatIds = palace.getAllChatIds();
+  for (const id of chatIds) await sendWeeklyCheckIn(id);
+}, { timezone: 'UTC' });
+
+// ── Bot commands ──────────────────────────────────────────────────────────────
+bot.start(async ctx => {
+  const chatId = ctx.chat.id;
+  // Register this chat for proactive messages
+  palace.updateProfile(chatId, { chatId: String(chatId), name: ctx.from.first_name || 'Zerlinda' });
+  await ctx.reply(
+    '🤖 *Claude AI — Personal Assistant*\n\n' +
+    '功能 / Features:\n' +
+    '• 📧 Gmail — 查邮件、发邮件\n' +
+    '• 🧠 长期记忆 Long-term memory\n' +
+    '• ⏰ 智能提醒 Smart reminders\n' +
+    '• ☀️ 每日早安问候 Daily morning greeting\n' +
+    '• 🧬 自我进化 Self-evolving\n' +
+    '• 🌍 多语言 Multilingual\n\n' +
+    '命令 / Commands:\n' +
+    '`/reminders` `/memory` `/profile` `/clear`',
+    { parse_mode: 'Markdown' }
+  );
+});
 
 bot.command('clear', ctx => {
   conversations.delete(ctx.chat.id);
-  ctx.reply('🗑️ 本次对话已重置（长期记忆保留）');
+  ctx.reply('🗑️ Session cleared (long-term memory kept)');
 });
 
 bot.command('memory', ctx => {
   const stats = palace.stats(ctx.chat.id);
-  if (!stats.length) return ctx.reply('暂无记忆数据。');
-  const lines = stats.map(s => `• ${s.hall}: ${s.count} 条`).join('\n');
-  ctx.reply(`🧠 *记忆统计*\n\n${lines}`, { parse_mode: 'Markdown' });
+  if (!stats.length) return ctx.reply('No memory yet. Chat more and I\'ll remember!');
+  const lines = stats.map(s => `• ${s.hall}: ${s.count}`).join('\n');
+  ctx.reply(`🧠 *Memory Stats*\n\n${lines}`, { parse_mode: 'Markdown' });
 });
 
 bot.command('reminders', ctx => {
-  const reminders = palace.listReminders(ctx.chat.id);
-  if (!reminders.length) return ctx.reply('没有待提醒的事项。\n\n说「提醒我明天9点开会」来设置一个！');
-  const lines = reminders.map(r => {
-    const t = new Date(r.due_at * 1000).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
-    const rep = r.repeat ? ` 🔁${r.repeat}` : '';
-    return `*ID ${r.id}* ${rep}\n${r.message}\n⏰ ${t}`;
+  const list = palace.listReminders(ctx.chat.id);
+  if (!list.length) return ctx.reply('No active reminders.\n\nSay "remind me tomorrow 9am to check emails" to set one!');
+  const lines = list.map(r => {
+    const t = new Date(r.dueAt).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' });
+    return `*ID ${r.id}*${r.repeat ? ` 🔁${r.repeat}` : ''}\n${r.message}\n⏰ ${t}`;
   }).join('\n\n');
-  ctx.reply(`⏰ *待提醒事项*\n\n${lines}\n\n说「取消提醒 ID X」可以删除`, { parse_mode: 'Markdown' });
+  ctx.reply(`⏰ *Active Reminders*\n\n${lines}`, { parse_mode: 'Markdown' });
 });
 
 bot.command('profile', ctx => {
   const profile = palace.getProfile(ctx.chat.id);
-  const keys = Object.keys(profile).filter(k => !k.startsWith('last_fact_') && k !== 'updated_at');
-  if (!keys.length) return ctx.reply('暂无用户画像数据。对话越多，我了解你越多！');
+  const keys = Object.keys(profile).filter(k => !['chatId','updated_at'].includes(k) && !k.startsWith('last_fact_'));
+  if (!keys.length) return ctx.reply('No profile data yet. The more we chat, the more I learn about you!');
   const lines = keys.map(k => `• *${k}*: ${profile[k]}`).join('\n');
-  ctx.reply(`👤 *用户画像*\n\n${lines}`, { parse_mode: 'Markdown' });
+  ctx.reply(`👤 *Your Profile*\n\n${lines}`, { parse_mode: 'Markdown' });
+});
+
+bot.command('goodmorning', async ctx => {
+  await sendMorningGreeting(ctx.chat.id);
 });
 
 bot.on('text', async ctx => {
   const text = ctx.message.text;
   const chatId = ctx.chat.id;
+
+  // Register chat_id on first interaction
+  const profile = palace.getProfile(chatId);
+  if (!profile.chatId) {
+    palace.updateProfile(chatId, { chatId: String(chatId), name: ctx.from.first_name || 'User' });
+  }
+
   console.log(`[${new Date().toISOString()}] ${ctx.from.first_name} (${chatId}): ${text.slice(0,80)}`);
   await ctx.sendChatAction('typing');
 
@@ -405,16 +537,15 @@ bot.on('text', async ctx => {
     }
   } catch (err) {
     console.error('Error:', err.message);
-    await ctx.reply('⚠️ 出错了，请重试或发 /clear');
+    await ctx.reply('⚠️ Error, please retry or /clear');
   }
 });
 
 // ── Launch ────────────────────────────────────────────────────────────────────
 bot.launch().then(() => {
-  console.log('🤖 Claude Telegram bot [Memory + Evolution + Heartbeat] READY!');
-  console.log(`📊 Memory DB: ${process.env.MEMORY_DB || 'palace.db'}`);
+  console.log('🤖 Claude Bot [Memory + Evolution + Proactive Greetings + Multilingual] READY!');
 }).catch(err => {
-  console.error('Failed to start:', err.message);
+  console.error('Failed:', err.message);
   process.exit(1);
 });
 
